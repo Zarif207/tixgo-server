@@ -193,13 +193,38 @@ async function run() {
     // Payment Related API
     // ------------------
     app.get("/payments", async (req, res) => {
-      const email = req.query.email;
-      const payments = await paymentsCollection
-        .find({ customerEmail: email })
-        .sort({ paidAt: -1 })
-        .toArray();
+      try {
+        const email = req.query.email;
 
-      res.send(payments);
+        const payments = await paymentsCollection
+          .aggregate([
+            { $match: { customerEmail: email } },
+            {
+              $lookup: {
+                from: "tickets",
+                localField: "ticketId",
+                foreignField: "_id",
+                as: "ticket",
+              },
+            },
+            { $unwind: "$ticket" },
+            {
+              $project: {
+                transactionId: 1,
+                amount: 1,
+                paidAt: 1,
+                ticketTitle: "$ticket.title",
+              },
+            },
+            { $sort: { paidAt: -1 } },
+          ])
+          .toArray();
+
+        res.send(payments);
+      } catch (err) {
+        console.error("GET /payments error:", err);
+        res.status(500).send({ message: "Server error" });
+      }
     });
 
     // ----------------------------------------------------
