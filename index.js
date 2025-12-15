@@ -844,6 +844,36 @@ async function run() {
     // admin/revenue-chart      → charts
     // admin/vendors/pending    → vendor approval
     // ----------------------------------------------------
+
+    app.get("/admin/profile", async (req, res) => {
+      try {
+        // later this email will come from JWT
+        const email = req.decoded?.email || req.query.email;
+
+        if (!email) {
+          return res.status(401).send({ message: "Unauthorized" });
+        }
+
+        const admin = await usersCollection.findOne({ email });
+
+        if (!admin || admin.role !== "admin") {
+          return res.status(403).send({ message: "Forbidden" });
+        }
+
+        res.send({
+          name: admin.name,
+          email: admin.email,
+          role: admin.role,
+          image: admin.image,
+          phone: admin.phone,
+          joined: admin.createdAt,
+        });
+      } catch (error) {
+        console.error("GET /admin/profile error:", error);
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
     app.get("/admin/stats", async (req, res) => {
       try {
         const usersCount = await usersCollection.countDocuments();
