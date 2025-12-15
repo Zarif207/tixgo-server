@@ -177,6 +177,7 @@ async function run() {
           ticketId,
           customerEmail: booking.customerEmail,
           amount: session.amount_total / 100,
+          quantity: booking.quantity,
           currency: session.currency,
           transactionId: session.payment_intent,
           paidAt: new Date(),
@@ -450,18 +451,21 @@ async function run() {
       try {
         const { verificationStatus, advertised, limit, sort, vendorEmail } =
           req.query;
-        const filter = {};
+
+        const filter = { hidden: { $ne: true } };
+
         if (verificationStatus) filter.verificationStatus = verificationStatus;
         if (advertised !== undefined) filter.advertised = advertised === "true";
         if (vendorEmail) filter.vendorEmail = vendorEmail;
 
         let cursor = ticketsCollection.find(filter);
+
         if (sort === "newest") cursor = cursor.sort({ createdAt: -1 });
         if (limit) cursor = cursor.limit(parseInt(limit));
+
         const result = await cursor.toArray();
         res.send(result);
       } catch (err) {
-        console.error("GET /tickets error:", err);
         res.status(500).send({ message: "Server error" });
       }
     });
@@ -472,7 +476,11 @@ async function run() {
         const limit = parseInt(req.query.limit) || 6;
 
         const advertisedTickets = await ticketsCollection
-          .find({ advertised: true, verificationStatus: "approved" })
+          .find({
+            advertised: true,
+            verificationStatus: "approved",
+            hidden: { $ne: true },
+          })
           .limit(limit)
           .toArray();
 
@@ -487,7 +495,10 @@ async function run() {
       try {
         const email = req.params.email;
         const tickets = await ticketsCollection
-          .find({ vendorEmail: email })
+          .find({
+            vendorEmail: email,
+            hidden: { $ne: true },
+          })
           .sort({ createdAt: -1 })
           .toArray();
         res.send(tickets);
@@ -504,7 +515,10 @@ async function run() {
         const oid = toObjectId(id);
         if (!oid) return res.status(400).send({ message: "invalid id" });
 
-        const ticket = await ticketsCollection.findOne({ _id: oid });
+        const ticket = await ticketsCollection.findOne({
+          _id: oid,
+          hidden: { $ne: true },
+        });
         if (!ticket)
           return res.status(404).send({ message: "Ticket not found" });
         res.send(ticket);
@@ -617,7 +631,8 @@ async function run() {
 
     // Delete ticket
     app.delete("/tickets/:id", async (req, res) => {
-      const id = new ObjectId(req.params.id);
+      const id = toObjectId(req.params.id);
+      if (!id) return res.status(400).send({ message: "Invalid id" });
 
       const ticket = await ticketsCollection.findOne({ _id: id });
 
@@ -877,7 +892,7 @@ async function run() {
               $group: {
                 _id: null,
                 totalRevenue: { $sum: "$amount" },
-                ticketsSold: { $sum: 1 },
+                ticketsSold: { $sum: "$quantity" },
               },
             },
           ])
@@ -919,7 +934,66 @@ async function run() {
         res.status(500).send({ message: "Server error" });
       }
     });
-    
+
+    app.get("/admin/users", async (req, res) => {
+      try {
+        const users = await usersCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.send(users);
+      } catch (err) {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    app.patch("/admin/users/:id/make-admin", async (req, res) => {
+      const id = toObjectId(req.params.id);
+      if (!id) return res.status(400).send({ message: "Invalid id" });
+
+      const result = await usersCollection.updateOne(
+        { _id: id },
+        { $set: { role: "admin" } }
+      );
+
+      res.send({ success: true });
+    });
+
+    app.patch("/admin/users/:id/make-vendor", async (req, res) => {
+      const id = toObjectId(req.params.id);
+      if (!id) return res.status(400).send({ message: "Invalid id" });
+
+      const result = await usersCollection.updateOne(
+        { _id: id },
+        { $set: { role: "vendor", isFraud: false } }
+      );
+
+      res.send({ success: true });
+    });
+
+    app.patch("/admin/users/:id/mark-fraud", async (req, res) => {
+      const id = toObjectId(req.params.id);
+      if (!id) return res.status(400).send({ message: "Invalid id" });
+
+      const user = await usersCollection.findOne({ _id: id });
+      if (!user || user.role !== "vendor") {
+        return res.status(400).send({ message: "Not a vendor" });
+      }
+
+      // 1. Mark user as fraud
+      await usersCollection.updateOne({ _id: id }, { $set: { isFraud: true } });
+
+      // 2. Hide all vendor tickets
+      await ticketsCollection.updateMany(
+        { vendorEmail: user.email },
+        { $set: { hidden: true } }
+      );
+
+      res.send({ success: true });
+    });
+
+    // --------------------------------
+
     console.log("✅ Backend routes registered.");
   } catch (err) {
     console.error("❌ ERROR during run():", err);
