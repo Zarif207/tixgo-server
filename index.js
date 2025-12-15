@@ -824,7 +824,10 @@ async function run() {
     });
 
     // ----------------------------------------------------
-    // ADMIN helpers / stats (simple)
+    // ADMIN/stats              → users, vendors, tickets, bookings
+    // admin/revenue-overview   → revenue cards
+    // admin/revenue-chart      → charts
+    // admin/vendors/pending    → vendor approval
     // ----------------------------------------------------
     app.get("/admin/stats", async (req, res) => {
       try {
@@ -866,9 +869,57 @@ async function run() {
       }
     });
 
-    // ----------------------------------------------------
-    // Final: log ready
-    // ----------------------------------------------------
+    app.get("/admin/revenue-overview", async (req, res) => {
+      try {
+        const revenueStats = await paymentsCollection
+          .aggregate([
+            {
+              $group: {
+                _id: null,
+                totalRevenue: { $sum: "$amount" },
+                ticketsSold: { $sum: 1 },
+              },
+            },
+          ])
+          .toArray();
+
+        const ticketsAdded = await ticketsCollection.countDocuments();
+
+        res.send({
+          totalRevenue: revenueStats[0]?.totalRevenue || 0,
+          ticketsSold: revenueStats[0]?.ticketsSold || 0,
+          ticketsAdded,
+        });
+      } catch (err) {
+        console.error("GET /admin/revenue-overview error:", err);
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    app.get("/admin/revenue-chart", async (req, res) => {
+      try {
+        const chartData = await paymentsCollection
+          .aggregate([
+            {
+              $group: {
+                _id: {
+                  $dateToString: { format: "%Y-%m-%d", date: "$paidAt" },
+                },
+                revenue: { $sum: "$amount" },
+                count: { $sum: 1 },
+              },
+            },
+            { $sort: { _id: 1 } },
+          ])
+          .toArray();
+
+        res.send(chartData);
+      } catch (err) {
+        console.error("GET /admin/revenue-chart error:", err);
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+    
     console.log("✅ Backend routes registered.");
   } catch (err) {
     console.error("❌ ERROR during run():", err);
