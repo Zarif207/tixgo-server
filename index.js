@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
+const admin = require("firebase-admin");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -11,6 +12,35 @@ const port = process.env.PORT || 3000;
 // middleware
 app.use(cors());
 app.use(express.json());
+
+/* ===============================
+    Firebase Admin Init (JSON FILE)
+================================ */
+const serviceAccount = require("./tixgo-firebase-adminsdk.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+/* ===============================
+    JWT Middleware
+================================ */
+const verifyJWT = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.decoded = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).send({ message: "Invalid token" });
+  }
+};
 
 // MongoDB URI
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.ujnwtbv.mongodb.net/?appName=Cluster0`;
@@ -52,6 +82,19 @@ async function run() {
     bookingsCollection = db.collection("bookings");
     paymentsCollection = db.collection("payments");
 
+    /* ===============================
+       🧱 Admin Middleware
+    ================================ */
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded?.email;
+      const user = await usersCollection.findOne({ email });
+
+      if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "Forbidden" });
+      }
+      next();
+    };
+
     // ----------------------------------------------------
     // ROOT
     // ----------------------------------------------------
@@ -64,7 +107,7 @@ async function run() {
     // ------------------
     // CREATE TICKET CHECKOUT (Stripe)
     // ------------------
-    app.post("/create-ticket-checkout", async (req, res) => {
+    app.post("/create-ticket-checkout", verifyJWT, async (req, res) => {
       try {
         const { bookingId } = req.body;
         const bookingOid = toObjectId(bookingId);
@@ -81,7 +124,6 @@ async function run() {
           return res.status(400).send({ message: "Already paid" });
         }
 
-        // 🚫 Block payment after departure
         const ticket = await ticketsCollection.findOne({
           _id: booking.ticketId,
         });
@@ -96,7 +138,7 @@ async function run() {
             .send({ message: "Departure time passed. Payment not allowed." });
         }
 
-        const totalAmount = booking.price * booking.quantity * 100; // cents
+        const totalAmount = booking.price * booking.quantity * 100; 
 
         const session = await stripe.checkout.sessions.create({
           payment_method_types: ["card"],
@@ -104,7 +146,7 @@ async function run() {
           line_items: [
             {
               price_data: {
-                currency: "usd", // ✅ Stripe supported
+                currency: "usd", 
                 unit_amount: totalAmount,
                 product_data: {
                   name: booking.title,
@@ -145,7 +187,6 @@ async function run() {
         const ticketId = toObjectId(session.metadata.ticketId);
         const quantity = parseInt(session.metadata.quantity);
 
-        // Prevent duplicate payment
         const exists = await paymentsCollection.findOne({
           transactionId: session.payment_intent,
         });
@@ -159,19 +200,16 @@ async function run() {
           return res.redirect(`${process.env.SITE_DOMAIN}/payment-success`);
         }
 
-        // Update booking status
         await bookingsCollection.updateOne(
           { _id: bookingId },
           { $set: { status: "paid", paidAt: new Date() } }
         );
 
-        // Reduce ticket quantity ONCE (HERE ONLY)
         await ticketsCollection.updateOne(
           { _id: ticketId, quantity: { $gte: quantity } },
           { $inc: { quantity: -quantity } }
         );
 
-        // Save payment record
         await paymentsCollection.insertOne({
           bookingId,
           ticketId,
@@ -193,9 +231,13 @@ async function run() {
     // ------------------
     // Payment Related API
     // ------------------
-    app.get("/payments", async (req, res) => {
+    app.get("/payments", verifyJWT, async (req, res) => {
       try {
         const email = req.query.email;
+
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
 
         const payments = await paymentsCollection
           .aggregate([
@@ -236,30 +278,26 @@ async function run() {
     // - PUT  /users/:email (update role/profile)
     // ----------------------------------------------------
 
+    /* ===============================
+       USERS
+    ================================ */
     app.post("/users", async (req, res) => {
-      try {
-        const user = req.body;
-        if (!user?.email)
-          return res.status(400).send({ message: "email required" });
+      const user = req.body;
+      if (!user?.email)
+        return res.status(400).send({ message: "email required" });
 
-        user.role = user.role || "user"; // user | vendor | admin
-        user.createdAt = new Date();
+      user.role = user.role || "user";
+      user.createdAt = new Date();
 
-        // upsert by email
-        const result = await usersCollection.updateOne(
-          { email: user.email },
-          { $set: user },
-          { upsert: true }
-        );
-
-        res.send({ success: true, result });
-      } catch (err) {
-        console.error("POST /users error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
+      const result = await usersCollection.updateOne(
+        { email: user.email },
+        { $set: user },
+        { upsert: true }
+      );
+      res.send({ success: true, result });
     });
 
-    app.get("/users", async (req, res) => {
+    app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const q = {};
         if (req.query.role) q.role = req.query.role;
@@ -274,7 +312,7 @@ async function run() {
       }
     });
 
-    app.get("/users/:email", async (req, res) => {
+    app.get("/users/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
         const user = await usersCollection.findOne({ email });
@@ -286,7 +324,7 @@ async function run() {
       }
     });
 
-    app.put("/users/:email", async (req, res) => {
+    app.put("/users/:email", verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const email = req.params.email;
         const update = req.body;
@@ -309,7 +347,7 @@ async function run() {
     // - PUT  /vendors/:email
     // ----------------------------------------------------
 
-    app.post("/vendors", async (req, res) => {
+    app.post("/vendors", verifyJWT, async (req, res) => {
       try {
         const vendor = req.body;
         if (!vendor?.userEmail)
@@ -329,7 +367,7 @@ async function run() {
       }
     });
 
-    app.get("/vendors", async (req, res) => {
+    app.get("/vendors", verifyJWT, verifyAdmin, async (req, res) => {
       try {
         const q = {};
         if (req.query.verified !== undefined)
@@ -345,7 +383,7 @@ async function run() {
       }
     });
 
-    app.get("/vendors/:email", async (req, res) => {
+    app.get("/vendors/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
         const vendor = await vendorsCollection.findOne({ userEmail: email });
@@ -358,15 +396,18 @@ async function run() {
       }
     });
 
-    app.put("/vendors/:email", async (req, res) => {
+    app.put("/vendors/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
         const update = req.body;
         const result = await vendorsCollection.updateOne(
           { userEmail: email },
-          { $set: update },
-          { upsert: false }
+          { $set: update }
         );
+
         res.send(result);
       } catch (err) {
         console.error("PUT /vendors/:email error:", err);
@@ -375,12 +416,11 @@ async function run() {
     });
 
     // patch ticket vendor
-    app.patch("/tickets/:id", async (req, res) => {
+    app.patch("/tickets/:id", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
         const updatedData = req.body;
 
-        // Prevent forbidden updates
         delete updatedData.verificationStatus;
         delete updatedData.vendorEmail;
         delete updatedData.vendorName;
@@ -427,9 +467,18 @@ async function run() {
     // ----------------------------------------------------
 
     // Create ticket (vendor)
-    app.post("/tickets", async (req, res) => {
+    app.post("/tickets", verifyJWT, async (req, res) => {
       try {
         const ticket = req.body;
+        if (ticket.vendorEmail !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
+        const vendor = await usersCollection.findOne({
+          email: req.decoded.email,
+        });
+        if (vendor?.isFraud) {
+          return res.status(403).send({ message: "Vendor is blocked" });
+        }
         if (!ticket?.vendorEmail)
           return res.status(400).send({ message: "vendorEmail required" });
         ticket.verificationStatus = "pending";
@@ -491,9 +540,12 @@ async function run() {
     });
 
     // Get tickets by vendor email
-    app.get("/tickets/vendor/:email", async (req, res) => {
+    app.get("/tickets/vendor/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
         const tickets = await ticketsCollection
           .find({
             vendorEmail: email,
@@ -501,6 +553,7 @@ async function run() {
           })
           .sort({ createdAt: -1 })
           .toArray();
+
         res.send(tickets);
       } catch (err) {
         console.error("GET /tickets/vendor/:email error:", err);
@@ -529,126 +582,151 @@ async function run() {
     });
 
     // Approve ticket (admin)
-    app.patch("/tickets/:id/approve", async (req, res) => {
-      try {
-        const id = req.params.id;
-        const oid = toObjectId(id);
-        if (!oid) return res.status(400).send({ message: "invalid id" });
+    app.patch(
+      "/tickets/:id/approve",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+          const oid = toObjectId(id);
+          if (!oid) return res.status(400).send({ message: "invalid id" });
 
-        const result = await ticketsCollection.updateOne(
-          { _id: oid },
-          { $set: { verificationStatus: "approved" } }
-        );
-        if (!result.matchedCount)
-          return res.status(404).send({ message: "Ticket not found" });
+          const result = await ticketsCollection.updateOne(
+            { _id: oid },
+            { $set: { verificationStatus: "approved" } }
+          );
+          if (!result.matchedCount)
+            return res.status(404).send({ message: "Ticket not found" });
 
-        res.send({ success: true, modifiedCount: result.modifiedCount });
-      } catch (err) {
-        console.error("PATCH /tickets/:id/approve error:", err);
-        res.status(500).send({ message: "Server error" });
+          res.send({ success: true, modifiedCount: result.modifiedCount });
+        } catch (err) {
+          console.error("PATCH /tickets/:id/approve error:", err);
+          res.status(500).send({ message: "Server error" });
+        }
       }
-    });
+    );
 
     // Reject ticket (admin)
-    app.patch("/tickets/:id/reject", async (req, res) => {
-      try {
-        const id = req.params.id;
-        const oid = toObjectId(id);
-        if (!oid) return res.status(400).send({ message: "invalid id" });
+    app.patch(
+      "/tickets/:id/reject",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+          const oid = toObjectId(id);
+          if (!oid) return res.status(400).send({ message: "invalid id" });
 
-        const result = await ticketsCollection.updateOne(
-          { _id: oid },
-          { $set: { verificationStatus: "rejected" } }
-        );
-        if (!result.matchedCount)
-          return res.status(404).send({ message: "Ticket not found" });
+          const result = await ticketsCollection.updateOne(
+            { _id: oid },
+            { $set: { verificationStatus: "rejected" } }
+          );
+          if (!result.matchedCount)
+            return res.status(404).send({ message: "Ticket not found" });
 
-        res.send({ success: true, modifiedCount: result.modifiedCount });
-      } catch (err) {
-        console.error("PATCH /tickets/:id/reject error:", err);
-        res.status(500).send({ message: "Server error" });
+          res.send({ success: true, modifiedCount: result.modifiedCount });
+        } catch (err) {
+          console.error("PATCH /tickets/:id/reject error:", err);
+          res.status(500).send({ message: "Server error" });
+        }
       }
-    });
+    );
 
-    // Advertise toggle: set advertised to true/false (server enforces <=6 advertised approved tickets)
-    app.patch("/tickets/:id/advertise", async (req, res) => {
-      try {
-        const id = req.params.id;
-        const { advertised } = req.body;
-        if (typeof advertised !== "boolean")
-          return res
-            .status(400)
-            .send({ message: "advertised must be boolean" });
-
-        // If turning ON, enforce max 6 advertised + approved tickets
-        if (advertised) {
-          const count = await ticketsCollection.countDocuments({
-            verificationStatus: "approved",
-            advertised: true,
-          });
-          if (count >= 6) {
+    app.patch(
+      "/tickets/:id/advertise",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+          const { advertised } = req.body;
+          if (typeof advertised !== "boolean")
             return res
               .status(400)
-              .send({ message: "Cannot advertise more than 6 tickets" });
+              .send({ message: "advertised must be boolean" });
+
+          if (advertised) {
+            const count = await ticketsCollection.countDocuments({
+              verificationStatus: "approved",
+              advertised: true,
+            });
+            if (count >= 6) {
+              return res
+                .status(400)
+                .send({ message: "Cannot advertise more than 6 tickets" });
+            }
           }
+
+          const oid = toObjectId(id);
+          if (!oid) return res.status(400).send({ message: "invalid id" });
+
+          const result = await ticketsCollection.updateOne(
+            { _id: oid },
+            { $set: { advertised } }
+          );
+          if (!result.matchedCount)
+            return res.status(404).send({ message: "Ticket not found" });
+
+          res.send({ success: true, modifiedCount: result.modifiedCount });
+        } catch (err) {
+          console.error("PATCH /tickets/:id/advertise error:", err);
+          res.status(500).send({ message: "Server error" });
         }
-
-        const oid = toObjectId(id);
-        if (!oid) return res.status(400).send({ message: "invalid id" });
-
-        const result = await ticketsCollection.updateOne(
-          { _id: oid },
-          { $set: { advertised } }
-        );
-        if (!result.matchedCount)
-          return res.status(404).send({ message: "Ticket not found" });
-
-        res.send({ success: true, modifiedCount: result.modifiedCount });
-      } catch (err) {
-        console.error("PATCH /tickets/:id/advertise error:", err);
-        res.status(500).send({ message: "Server error" });
       }
-    });
+    );
 
     // Update ticket (vendor)
-    app.put("/tickets/:id", async (req, res) => {
-      try {
-        const id = req.params.id;
-        const update = req.body;
-        const oid = toObjectId(id);
-        if (!oid) return res.status(400).send({ message: "invalid id" });
+    app.put("/tickets/:id", verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const update = req.body;
+      const oid = toObjectId(id);
 
-        const result = await ticketsCollection.updateOne(
-          { _id: oid },
-          { $set: update }
-        );
-        res.send(result);
-      } catch (err) {
-        console.error("PUT /tickets/:id error:", err);
-        res.status(500).send({ message: "Server error" });
+      if (!oid) {
+        return res.status(400).send({ message: "Invalid id" });
       }
-    });
 
-    // Delete ticket
-    app.delete("/tickets/:id", async (req, res) => {
-      const id = toObjectId(req.params.id);
-      if (!id) return res.status(400).send({ message: "Invalid id" });
-
-      const ticket = await ticketsCollection.findOne({ _id: id });
+      const ticket = await ticketsCollection.findOne({ _id: oid });
 
       if (!ticket) {
         return res.status(404).send({ message: "Ticket not found" });
       }
 
-      if (ticket.verificationStatus === "rejected") {
-        return res.status(403).send({
-          message: "Rejected tickets cannot be deleted",
-        });
+      // 🔐 2️⃣ IMPORTANT SECURITY CHECK (THIS IS #5)
+      if (ticket.vendorEmail !== req.decoded.email) {
+        return res.status(403).send({ message: "Forbidden" });
       }
 
-      const result = await ticketsCollection.deleteOne({ _id: id });
+
+      const result = await ticketsCollection.updateOne(
+        { _id: oid },
+        { $set: update }
+      );
+
       res.send(result);
     });
+
+    // Delete ticket
+    app.delete("/tickets/:id", verifyJWT, async (req, res) => {
+  const id = toObjectId(req.params.id);
+  if (!id) return res.status(400).send({ message: "Invalid id" });
+  const ticket = await ticketsCollection.findOne({ _id: id });
+  if (!ticket) {
+    return res.status(404).send({ message: "Ticket not found" });
+  }
+  if (ticket.vendorEmail !== req.decoded.email) {
+    return res.status(403).send({ message: "Forbidden" });
+  }
+
+  if (ticket.verificationStatus === "rejected") {
+    return res.status(403).send({
+      message: "Rejected tickets cannot be deleted",
+    });
+  }
+
+  const result = await ticketsCollection.deleteOne({ _id: id });
+  res.send(result);
+});
 
     // // Get advertised tickets (homepage)
     // app.get("/tickets/advertised", async (req, res) => {
@@ -672,9 +750,14 @@ async function run() {
     // - GET  /bookings?email=... (user bookings)
     // ----------------------------------------------------
 
-    app.post("/bookings", async (req, res) => {
+    app.post("/bookings", verifyJWT, async (req, res) => {
       try {
         const booking = req.body;
+
+      
+        if (booking.customerEmail !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
         if (
           !booking?.ticketId ||
           !booking?.quantity ||
@@ -689,12 +772,12 @@ async function run() {
         if (!ticketOid)
           return res.status(400).send({ message: "invalid ticketId" });
 
-        // Fetch ticket
+      
         const ticket = await ticketsCollection.findOne({ _id: ticketOid });
         if (!ticket)
           return res.status(404).send({ message: "Ticket not found" });
 
-        // only allow booking if ticket is approved
+      
         if (ticket.verificationStatus !== "approved") {
           return res
             .status(400)
@@ -707,7 +790,7 @@ async function run() {
             .send({ message: "Not enough tickets available" });
         }
 
-        // ❌ NO STOCK REDUCTION HERE
+       
 
         booking.ticketId = ticket._id;
         booking.vendorEmail = ticket.vendorEmail;
@@ -725,9 +808,14 @@ async function run() {
     });
 
     // Get user bookings
-    app.get("/bookings", async (req, res) => {
+    app.get("/bookings", verifyJWT, async (req, res) => {
       try {
         const email = req.query.email;
+
+        
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
 
         const bookings = await bookingsCollection
           .aggregate([
@@ -767,9 +855,15 @@ async function run() {
     });
 
     // Vendor accepts booking
-    app.patch("/bookings/:id/accept", async (req, res) => {
+    app.patch("/bookings/:id/accept", verifyJWT, async (req, res) => {
       const id = toObjectId(req.params.id);
       if (!id) return res.status(400).send({ message: "Invalid id" });
+      const booking = await bookingsCollection.findOne({ _id: id });
+      if (!booking)
+        return res.status(404).send({ message: "Booking not found" });
+      if (booking.vendorEmail !== req.decoded.email) {
+        return res.status(403).send({ message: "Forbidden" });
+      }
 
       const result = await bookingsCollection.updateOne(
         { _id: id, status: "pending" },
@@ -780,9 +874,16 @@ async function run() {
     });
 
     // Vendor rejects booking
-    app.patch("/bookings/:id/reject", async (req, res) => {
+    app.patch("/bookings/:id/reject", verifyJWT, async (req, res) => {
       const id = toObjectId(req.params.id);
       if (!id) return res.status(400).send({ message: "Invalid id" });
+
+      const booking = await bookingsCollection.findOne({ _id: id });
+      if (!booking)
+        return res.status(404).send({ message: "Booking not found" });
+      if (booking.vendorEmail !== req.decoded.email) {
+        return res.status(403).send({ message: "Forbidden" });
+      }
 
       const result = await bookingsCollection.updateOne(
         { _id: id, status: "pending" },
@@ -793,10 +894,13 @@ async function run() {
     });
 
     // Get booking requests for vendor
-    // Get booking requests for vendor
-    app.get("/bookings/vendor/:email", async (req, res) => {
+    app.get("/bookings/vendor/:email", verifyJWT, async (req, res) => {
       try {
         const vendorEmail = req.params.email;
+
+        if (vendorEmail !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
 
         const bookings = await bookingsCollection
           .aggregate([
@@ -845,77 +949,77 @@ async function run() {
     // admin/vendors/pending    → vendor approval
     // ----------------------------------------------------
 
-    app.get("/admin/profile", async (req, res) => {
-      try {
-        // later this email will come from JWT
-        const email = req.decoded?.email || req.query.email;
+    /* ===============================
+       🔐 ADMIN PROFILE (FIXED)
+    ================================ */
+    app.get("/admin/profile", verifyJWT, verifyAdmin, async (req, res) => {
+      const email = req.decoded.email;
 
-        if (!email) {
-          return res.status(401).send({ message: "Unauthorized" });
+      const adminUser = await usersCollection.findOne({ email });
+
+      res.send({
+        name: adminUser.name,
+        email: adminUser.email,
+        role: adminUser.role,
+        image: adminUser.photo, 
+        phone: adminUser.phone || "",
+        joined: adminUser.createdAt,
+      });
+    });
+
+    app.get("/admin/stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const usersCount = await usersCollection.countDocuments();
+      const vendorsCount = await vendorsCollection.countDocuments();
+      const ticketsCount = await ticketsCollection.countDocuments();
+      const bookingsCount = await bookingsCollection.countDocuments();
+      res.send({ usersCount, vendorsCount, ticketsCount, bookingsCount });
+    });
+
+    app.get(
+      "/admin/vendors/pending",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const pending = await vendorsCollection
+            .find({ verified: false })
+            .toArray();
+          res.send(pending);
+        } catch (err) {
+          console.error("GET /admin/vendors/pending error:", err);
+          res.status(500).send({ message: "Server error" });
         }
+      }
+    );
 
-        const admin = await usersCollection.findOne({ email });
-
-        if (!admin || admin.role !== "admin") {
-          return res.status(403).send({ message: "Forbidden" });
+    app.patch(
+      "/admin/vendors/:email/verify",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const email = req.params.email;
+          const verify = req.body.verify === true;
+          const result = await vendorsCollection.updateOne(
+            { userEmail: email },
+            { $set: { verified: verify } }
+          );
+          res.send({ success: true, result });
+        } catch (err) {
+          console.error("PATCH /admin/vendors/:email/verify error:", err);
+          res.status(500).send({ message: "Server error" });
         }
-
-        res.send({
-          name: admin.name,
-          email: admin.email,
-          role: admin.role,
-          image: admin.image,
-          phone: admin.phone,
-          joined: admin.createdAt,
-        });
-      } catch (error) {
-        console.error("GET /admin/profile error:", error);
-        res.status(500).send({ message: "Server error" });
       }
-    });
+    );
 
-    app.get("/admin/stats", async (req, res) => {
-      try {
-        const usersCount = await usersCollection.countDocuments();
-        const vendorsCount = await vendorsCollection.countDocuments();
-        const ticketsCount = await ticketsCollection.countDocuments();
-        const bookingsCount = await bookingsCollection.countDocuments();
-        res.send({ usersCount, vendorsCount, ticketsCount, bookingsCount });
-      } catch (err) {
-        console.error("GET /admin/stats error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
-    });
-
-    app.get("/admin/vendors/pending", async (req, res) => {
-      try {
-        const pending = await vendorsCollection
-          .find({ verified: false })
-          .toArray();
-        res.send(pending);
-      } catch (err) {
-        console.error("GET /admin/vendors/pending error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
-    });
-
-    app.patch("/admin/vendors/:email/verify", async (req, res) => {
-      try {
-        const email = req.params.email;
-        const verify = req.body.verify === true;
-        const result = await vendorsCollection.updateOne(
-          { userEmail: email },
-          { $set: { verified: verify } }
-        );
-        res.send({ success: true, result });
-      } catch (err) {
-        console.error("PATCH /admin/vendors/:email/verify error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
-    });
-
-    app.get("/admin/revenue-overview", async (req, res) => {
-      try {
+    /* ===============================
+       ADMIN REVENUE
+    ================================ */
+    app.get(
+      "/admin/revenue-overview",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
         const revenueStats = await paymentsCollection
           .aggregate([
             {
@@ -935,23 +1039,20 @@ async function run() {
           ticketsSold: revenueStats[0]?.ticketsSold || 0,
           ticketsAdded,
         });
-      } catch (err) {
-        console.error("GET /admin/revenue-overview error:", err);
-        res.status(500).send({ message: "Server error" });
       }
-    });
+    );
 
-    app.get("/admin/revenue-chart", async (req, res) => {
-      try {
+    app.get(
+      "/admin/revenue-chart",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
         const chartData = await paymentsCollection
           .aggregate([
             {
               $group: {
-                _id: {
-                  $dateToString: { format: "%Y-%m-%d", date: "$paidAt" },
-                },
+                _id: { $dateToString: { format: "%Y-%m-%d", date: "$paidAt" } },
                 revenue: { $sum: "$amount" },
-                count: { $sum: 1 },
               },
             },
             { $sort: { _id: 1 } },
@@ -959,68 +1060,73 @@ async function run() {
           .toArray();
 
         res.send(chartData);
-      } catch (err) {
-        console.error("GET /admin/revenue-chart error:", err);
-        res.status(500).send({ message: "Server error" });
       }
+    );
+
+    app.get("/admin/users", verifyJWT, verifyAdmin, async (req, res) => {
+      const users = await usersCollection.find().toArray();
+      res.send(users);
     });
 
-    app.get("/admin/users", async (req, res) => {
-      try {
-        const users = await usersCollection
-          .find()
-          .sort({ createdAt: -1 })
-          .toArray();
-        res.send(users);
-      } catch (err) {
-        res.status(500).send({ message: "Server error" });
+    app.patch(
+      "/admin/users/:id/make-admin",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        const id = toObjectId(req.params.id);
+        await usersCollection.updateOne(
+          { _id: id },
+          { $set: { role: "admin" } }
+        );
+        res.send({ success: true });
       }
-    });
+    );
 
-    app.patch("/admin/users/:id/make-admin", async (req, res) => {
-      const id = toObjectId(req.params.id);
-      if (!id) return res.status(400).send({ message: "Invalid id" });
+    app.patch(
+      "/admin/users/:id/make-vendor",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        const id = toObjectId(req.params.id);
+        if (!id) return res.status(400).send({ message: "Invalid id" });
 
-      const result = await usersCollection.updateOne(
-        { _id: id },
-        { $set: { role: "admin" } }
-      );
+        const result = await usersCollection.updateOne(
+          { _id: id },
+          { $set: { role: "vendor", isFraud: false } }
+        );
 
-      res.send({ success: true });
-    });
-
-    app.patch("/admin/users/:id/make-vendor", async (req, res) => {
-      const id = toObjectId(req.params.id);
-      if (!id) return res.status(400).send({ message: "Invalid id" });
-
-      const result = await usersCollection.updateOne(
-        { _id: id },
-        { $set: { role: "vendor", isFraud: false } }
-      );
-
-      res.send({ success: true });
-    });
-
-    app.patch("/admin/users/:id/mark-fraud", async (req, res) => {
-      const id = toObjectId(req.params.id);
-      if (!id) return res.status(400).send({ message: "Invalid id" });
-
-      const user = await usersCollection.findOne({ _id: id });
-      if (!user || user.role !== "vendor") {
-        return res.status(400).send({ message: "Not a vendor" });
+        res.send({ success: true });
       }
+    );
 
-      // 1. Mark user as fraud
-      await usersCollection.updateOne({ _id: id }, { $set: { isFraud: true } });
+    app.patch(
+      "/admin/users/:id/mark-fraud",
+      verifyJWT,
+      verifyAdmin,
+      async (req, res) => {
+        const id = toObjectId(req.params.id);
+        if (!id) return res.status(400).send({ message: "Invalid id" });
 
-      // 2. Hide all vendor tickets
-      await ticketsCollection.updateMany(
-        { vendorEmail: user.email },
-        { $set: { hidden: true } }
-      );
+        const user = await usersCollection.findOne({ _id: id });
+        if (!user || user.role !== "vendor") {
+          return res.status(400).send({ message: "Not a vendor" });
+        }
 
-      res.send({ success: true });
-    });
+       
+        await usersCollection.updateOne(
+          { _id: id },
+          { $set: { isFraud: true } }
+        );
+
+      
+        await ticketsCollection.updateMany(
+          { vendorEmail: user.email },
+          { $set: { hidden: true } }
+        );
+
+        res.send({ success: true });
+      }
+    );
 
     // --------------------------------
 
