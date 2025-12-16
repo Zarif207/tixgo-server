@@ -138,7 +138,7 @@ async function run() {
             .send({ message: "Departure time passed. Payment not allowed." });
         }
 
-        const totalAmount = booking.price * booking.quantity * 100; 
+        const totalAmount = booking.price * booking.quantity * 100;
 
         const session = await stripe.checkout.sessions.create({
           payment_method_types: ["card"],
@@ -146,7 +146,7 @@ async function run() {
           line_items: [
             {
               price_data: {
-                currency: "usd", 
+                currency: "usd",
                 unit_amount: totalAmount,
                 product_data: {
                   name: booking.title,
@@ -281,6 +281,21 @@ async function run() {
     /* ===============================
        USERS
     ================================ */
+
+    // GET USER ROLE
+    app.get("/users/role", verifyJWT, async (req, res) => {
+      const email = req.query.email;
+
+      // 🔒 security check
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: "Forbidden access" });
+      }
+
+      const user = await usersCollection.findOne({ email });
+
+      res.send({ role: user?.role || "user" });
+    });
+
     app.post("/users", async (req, res) => {
       const user = req.body;
       if (!user?.email)
@@ -697,7 +712,6 @@ async function run() {
         return res.status(403).send({ message: "Forbidden" });
       }
 
-
       const result = await ticketsCollection.updateOne(
         { _id: oid },
         { $set: update }
@@ -708,25 +722,25 @@ async function run() {
 
     // Delete ticket
     app.delete("/tickets/:id", verifyJWT, async (req, res) => {
-  const id = toObjectId(req.params.id);
-  if (!id) return res.status(400).send({ message: "Invalid id" });
-  const ticket = await ticketsCollection.findOne({ _id: id });
-  if (!ticket) {
-    return res.status(404).send({ message: "Ticket not found" });
-  }
-  if (ticket.vendorEmail !== req.decoded.email) {
-    return res.status(403).send({ message: "Forbidden" });
-  }
+      const id = toObjectId(req.params.id);
+      if (!id) return res.status(400).send({ message: "Invalid id" });
+      const ticket = await ticketsCollection.findOne({ _id: id });
+      if (!ticket) {
+        return res.status(404).send({ message: "Ticket not found" });
+      }
+      if (ticket.vendorEmail !== req.decoded.email) {
+        return res.status(403).send({ message: "Forbidden" });
+      }
 
-  if (ticket.verificationStatus === "rejected") {
-    return res.status(403).send({
-      message: "Rejected tickets cannot be deleted",
+      if (ticket.verificationStatus === "rejected") {
+        return res.status(403).send({
+          message: "Rejected tickets cannot be deleted",
+        });
+      }
+
+      const result = await ticketsCollection.deleteOne({ _id: id });
+      res.send(result);
     });
-  }
-
-  const result = await ticketsCollection.deleteOne({ _id: id });
-  res.send(result);
-});
 
     // // Get advertised tickets (homepage)
     // app.get("/tickets/advertised", async (req, res) => {
@@ -754,7 +768,6 @@ async function run() {
       try {
         const booking = req.body;
 
-      
         if (booking.customerEmail !== req.decoded.email) {
           return res.status(403).send({ message: "Forbidden" });
         }
@@ -772,12 +785,10 @@ async function run() {
         if (!ticketOid)
           return res.status(400).send({ message: "invalid ticketId" });
 
-      
         const ticket = await ticketsCollection.findOne({ _id: ticketOid });
         if (!ticket)
           return res.status(404).send({ message: "Ticket not found" });
 
-      
         if (ticket.verificationStatus !== "approved") {
           return res
             .status(400)
@@ -789,8 +800,6 @@ async function run() {
             .status(400)
             .send({ message: "Not enough tickets available" });
         }
-
-       
 
         booking.ticketId = ticket._id;
         booking.vendorEmail = ticket.vendorEmail;
@@ -812,7 +821,6 @@ async function run() {
       try {
         const email = req.query.email;
 
-        
         if (email !== req.decoded.email) {
           return res.status(403).send({ message: "Forbidden" });
         }
@@ -961,7 +969,7 @@ async function run() {
         name: adminUser.name,
         email: adminUser.email,
         role: adminUser.role,
-        image: adminUser.photo, 
+        image: adminUser.photo,
         phone: adminUser.phone || "",
         joined: adminUser.createdAt,
       });
@@ -1112,13 +1120,11 @@ async function run() {
           return res.status(400).send({ message: "Not a vendor" });
         }
 
-       
         await usersCollection.updateOne(
           { _id: id },
           { $set: { isFraud: true } }
         );
 
-      
         await ticketsCollection.updateMany(
           { vendorEmail: user.email },
           { $set: { hidden: true } }
