@@ -6,17 +6,38 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const admin = require("firebase-admin");
 
+let isConnected = false;
+
 const app = express();
 const port = process.env.PORT || 3000;
 
 // middleware
-app.use(cors());
+// app.use(cors());
+
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "https://tixgo.vercel.app",
+      "https://tixgo.netlify.app",
+    ],
+  })
+);
+
 app.use(express.json());
 
+app.get("/", (req, res) => {
+  res.send("TixGo backend is running");
+});
+
 /* ===============================
-    Firebase Admin Init (JSON FILE)
+    Firebase Admin Init 
 ================================ */
-const serviceAccount = require("./tixgo-firebase-adminsdk.json");
+
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8"
+);
+const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -52,7 +73,6 @@ const client = new MongoClient(uri, {
   },
 });
 
-// Collections (will be assigned after connect)
 let db;
 let usersCollection;
 let vendorsCollection;
@@ -72,9 +92,6 @@ function toObjectId(id) {
 // Start function
 async function run() {
   try {
-    await client.connect();
-    console.log("🟢 MongoDB Connected!");
-
     db = client.db("tixgo_db");
     usersCollection = db.collection("users");
     vendorsCollection = db.collection("vendors");
@@ -82,8 +99,21 @@ async function run() {
     bookingsCollection = db.collection("bookings");
     paymentsCollection = db.collection("payments");
 
+    // ------------------
+    // DATABASE INDEXES
+    // ------------------
+    await bookingsCollection.createIndex({ customerEmail: 1 });
+    await bookingsCollection.createIndex({ vendorEmail: 1 });
+
+    await paymentsCollection.createIndex(
+      { transactionId: 1 },
+      { unique: true }
+    );
+
+    await ticketsCollection.createIndex({ vendorEmail: 1 });
+
     /* ===============================
-       🧱 Admin Middleware
+        Admin Middleware
     ================================ */
     const verifyAdmin = async (req, res, next) => {
       const email = req.decoded?.email;
@@ -95,22 +125,45 @@ async function run() {
       next();
     };
 
-    // ----------------------------------------------------
-    // ROOT
-    // ----------------------------------------------------
-    app.get("/", (req, res) => {
-      res.send("Tixgo backend is running! 🚀");
-    });
+    /* ===============================
+         Vendor Middleware
+    ================================ */
+    const verifyVendor = async (req, res, next) => {
+      const email = req.decoded?.email;
+      const user = await usersCollection.findOne({ email });
+
+      if (!user || user.role !== "vendor") {
+        return res.status(403).send({ message: "Forbidden" });
+      }
+
+      if (user.isFraud === true) {
+        return res.status(403).send({
+          message:
+            "Your vendor account has been suspended due to fraud activity",
+        });
+      }
+
+      req.vendor = user;
+      next();
+    };
+
+    // // ----------------------------------------------------
+    // // ROOT
+    // // ----------------------------------------------------
+    // app.get("/", (req, res) => {
+    //   res.send("Tixgo backend is running! 🚀");
+    // });
 
     // || PAYMENT API ||
 
     // ------------------
-    // CREATE TICKET CHECKOUT (Stripe)
+    // CREATE TICKET CHECKOUT Stripe
     // ------------------
     app.post("/create-ticket-checkout", verifyJWT, async (req, res) => {
       try {
         const { bookingId } = req.body;
         const bookingOid = toObjectId(bookingId);
+
         if (!bookingOid) {
           return res.status(400).send({ message: "Invalid booking id" });
         }
@@ -124,21 +177,31 @@ async function run() {
           return res.status(400).send({ message: "Already paid" });
         }
 
+        if (booking.status !== "accepted") {
+          return res
+            .status(400)
+            .send({ message: "Booking must be accepted before payment" });
+        }
+
         const ticket = await ticketsCollection.findOne({
           _id: booking.ticketId,
         });
-
         if (!ticket) {
           return res.status(404).send({ message: "Ticket not found" });
         }
 
-        if (new Date(ticket.departure) <= new Date()) {
-          return res
-            .status(400)
-            .send({ message: "Departure time passed. Payment not allowed." });
+        if (ticket.departure <= new Date()) {
+          return res.status(400).send({ message: "Departure time passed" });
         }
 
-        const totalAmount = booking.price * booking.quantity * 100;
+        const unitPrice = Number(booking.price);
+        const quantity = Number(booking.quantity);
+
+        if (!unitPrice || !quantity || unitPrice <= 0 || quantity <= 0) {
+          return res.status(400).send({ message: "Invalid price or quantity" });
+        }
+
+        const unitAmount = Math.round(unitPrice * 100);
 
         const session = await stripe.checkout.sessions.create({
           payment_method_types: ["card"],
@@ -147,21 +210,21 @@ async function run() {
             {
               price_data: {
                 currency: "usd",
-                unit_amount: totalAmount,
+                unit_amount: unitAmount,
                 product_data: {
                   name: booking.title,
                 },
               },
-              quantity: 1,
+              quantity,
             },
           ],
           metadata: {
             bookingId: booking._id.toString(),
             ticketId: booking.ticketId.toString(),
-            quantity: booking.quantity.toString(),
+            quantity: quantity.toString(),
           },
           success_url: `${process.env.BACKEND_DOMAIN}/stripe/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${process.env.SITE_DOMAIN}/payment-cancelled`,
+          cancel_url: `${process.env.BACKEND_DOMAIN}/stripe/payment-cancelled?bookingId=${booking._id}`,
         });
 
         res.send({ url: session.url });
@@ -177,6 +240,9 @@ async function run() {
     app.get("/stripe/payment-success", async (req, res) => {
       try {
         const sessionId = req.query.session_id;
+        if (!sessionId)
+          return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
+
         const session = await stripe.checkout.sessions.retrieve(sessionId);
 
         if (session.payment_status !== "paid") {
@@ -185,37 +251,35 @@ async function run() {
 
         const bookingId = toObjectId(session.metadata.bookingId);
         const ticketId = toObjectId(session.metadata.ticketId);
-        const quantity = parseInt(session.metadata.quantity);
+        const quantity = Number(session.metadata.quantity);
 
-        const exists = await paymentsCollection.findOne({
+        const booking = await bookingsCollection.findOne({ _id: bookingId });
+        if (!booking)
+          return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
+
+        const alreadyPaid = await paymentsCollection.findOne({
           transactionId: session.payment_intent,
         });
 
-        const booking = await bookingsCollection.findOne({ _id: bookingId });
-        if (!booking) {
-          return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
-        }
-
-        if (exists) {
+        if (alreadyPaid) {
           return res.redirect(`${process.env.SITE_DOMAIN}/payment-success`);
         }
 
-        await bookingsCollection.updateOne(
-          { _id: bookingId },
+        const updateBooking = await bookingsCollection.updateOne(
+          { _id: bookingId, status: "accepted" },
           { $set: { status: "paid", paidAt: new Date() } }
         );
 
-        await ticketsCollection.updateOne(
-          { _id: ticketId, quantity: { $gte: quantity } },
-          { $inc: { quantity: -quantity } }
-        );
+        if (!updateBooking.modifiedCount) {
+          return res.redirect(`${process.env.SITE_DOMAIN}/payment-success`);
+        }
 
         await paymentsCollection.insertOne({
           bookingId,
           ticketId,
           customerEmail: booking.customerEmail,
           amount: session.amount_total / 100,
-          quantity: booking.quantity,
+          quantity,
           currency: session.currency,
           transactionId: session.payment_intent,
           paidAt: new Date(),
@@ -224,7 +288,35 @@ async function run() {
         res.redirect(`${process.env.SITE_DOMAIN}/payment-success`);
       } catch (err) {
         console.error("Payment Success Error:", err);
-        res.status(500).send({ message: err.message });
+        res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
+      }
+    });
+
+    // ------------------
+    // PAYMENT CANCELLED
+    // ------------------
+    app.get("/stripe/payment-cancelled", async (req, res) => {
+      try {
+        const bookingId = toObjectId(req.query.bookingId);
+        if (!bookingId) {
+          return res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
+        }
+
+        const booking = await bookingsCollection.findOne({ _id: bookingId });
+        if (!booking || booking.status !== "accepted") {
+          return res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
+        }
+        await ticketsCollection.updateOne(
+          { _id: booking.ticketId },
+          { $inc: { quantity: booking.quantity } }
+        );
+
+        await bookingsCollection.deleteOne({ _id: bookingId });
+
+        res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
+      } catch (err) {
+        console.error("Payment cancel error:", err);
+        res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
       }
     });
 
@@ -270,97 +362,87 @@ async function run() {
       }
     });
 
-    // ----------------------------------------------------
-    // USERS
-    // - POST /users        (create user)
-    // - GET  /users        (list users)
-    // - GET  /users/:email (get user by email)
-    // - PUT  /users/:email (update role/profile)
-    // ----------------------------------------------------
-
     /* ===============================
        USERS
     ================================ */
 
-    // GET USER ROLE
     app.get("/users/role", verifyJWT, async (req, res) => {
-      const email = req.query.email;
-
-      // 🔒 security check
-      if (email !== req.decoded.email) {
-        return res.status(403).send({ message: "Forbidden access" });
-      }
-
+      const email = req.decoded.email;
       const user = await usersCollection.findOne({ email });
-
       res.send({ role: user?.role || "user" });
     });
 
     app.post("/users", async (req, res) => {
-      const user = req.body;
-      if (!user?.email)
-        return res.status(400).send({ message: "email required" });
+      const { email, name, photo } = req.body;
+      if (!email) return res.status(400).send({ message: "email required" });
 
-      user.role = user.role || "user";
-      user.createdAt = new Date();
+      const existingUser = await usersCollection.findOne({ email });
 
-      const result = await usersCollection.updateOne(
-        { email: user.email },
-        { $set: user },
-        { upsert: true }
-      );
-      res.send({ success: true, result });
+      if (existingUser) {
+        await usersCollection.updateOne(
+          { email },
+          {
+            $set: {
+              name: name || existingUser.name,
+              photo: photo || existingUser.photo,
+              lastLogin: new Date(),
+            },
+          }
+        );
+        return res.send({ success: true, message: "User updated" });
+      }
+
+      await usersCollection.insertOne({
+        email,
+        name: name || "",
+        photo: photo || "",
+        role: "user",
+        isFraud: false,
+        createdAt: new Date(),
+      });
+
+      res.send({ success: true, message: "User created" });
     });
 
     app.get("/users", verifyJWT, verifyAdmin, async (req, res) => {
-      try {
-        const q = {};
-        if (req.query.role) q.role = req.query.role;
-        const users = await usersCollection
-          .find(q)
-          .sort({ createdAt: -1 })
-          .toArray();
-        res.send(users);
-      } catch (err) {
-        console.error("GET /users error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
+      const q = {};
+      if (req.query.role) q.role = req.query.role;
+      const users = await usersCollection
+        .find(q)
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.send(users);
     });
 
-    app.get("/users/:email", verifyJWT, async (req, res) => {
-      try {
-        const email = req.params.email;
-        const user = await usersCollection.findOne({ email });
-        if (!user) return res.status(404).send({ message: "User not found" });
-        res.send(user);
-      } catch (err) {
-        console.error("GET /users/:email error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
+    app.get("/users/profile", verifyJWT, async (req, res) => {
+      const email = req.decoded.email;
+      const user = await usersCollection.findOne({ email });
+
+      if (!user) return res.status(404).send({ message: "User not found" });
+
+      res.send(user);
     });
 
     app.put("/users/:email", verifyJWT, verifyAdmin, async (req, res) => {
-      try {
-        const email = req.params.email;
-        const update = req.body;
-        const result = await usersCollection.updateOne(
-          { email },
-          { $set: update }
-        );
-        res.send(result);
-      } catch (err) {
-        console.error("PUT /users/:email error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
+      const { name, photo, phone } = req.body;
+
+      const update = {
+        ...(name && { name }),
+        ...(photo && { photo }),
+        ...(phone && { phone }),
+      };
+
+      const result = await usersCollection.updateOne(
+        { email: req.params.email },
+        { $set: update }
+      );
+
+      res.send({ success: true, result });
     });
 
-    // ----------------------------------------------------
-    // VENDORS
-    // - POST /vendors
-    // - GET  /vendors
-    // - GET  /vendors/:email
-    // - PUT  /vendors/:email
-    // ----------------------------------------------------
+    /* ===============================
+                  VENDORS
+      ================================ */
 
     app.post("/vendors", verifyJWT, async (req, res) => {
       try {
@@ -401,9 +483,19 @@ async function run() {
     app.get("/vendors/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
+
+        if (
+          email !== req.decoded.email &&
+          (await usersCollection.findOne({ email: req.decoded.email }))
+            ?.role !== "admin"
+        ) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
+
         const vendor = await vendorsCollection.findOne({ userEmail: email });
         if (!vendor)
           return res.status(404).send({ message: "Vendor not found" });
+
         res.send(vendor);
       } catch (err) {
         console.error("GET /vendors/:email error:", err);
@@ -430,33 +522,51 @@ async function run() {
       }
     });
 
-    // patch ticket vendor
+        /* ===============================
+                     TICKETS
+         ================================ */
+    
+
     app.patch("/tickets/:id", verifyJWT, async (req, res) => {
       try {
         const { id } = req.params;
-        const updatedData = req.body;
+        const oid = toObjectId(id);
+        if (!oid) return res.status(400).send({ message: "Invalid id" });
+
+        const updatedData = { ...req.body };
 
         delete updatedData.verificationStatus;
         delete updatedData.vendorEmail;
         delete updatedData.vendorName;
         delete updatedData.createdAt;
+        delete updatedData._id;
 
-        const ticket = await ticketsCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
+        const ticket = await ticketsCollection.findOne({ _id: oid });
         if (!ticket) {
           return res.status(404).send({ message: "Ticket not found" });
         }
-
+        if (ticket.vendorEmail !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden" });
+        }
         if (ticket.verificationStatus === "rejected") {
-          return res.status(403).send({
-            message: "Rejected tickets cannot be updated",
-          });
+          return res
+            .status(403)
+            .send({ message: "Rejected tickets cannot be updated" });
+        }
+        if ("perks" in updatedData) {
+          if (!Array.isArray(updatedData.perks)) {
+            updatedData.perks = [];
+          }
+        } else {
+          delete updatedData.perks;
         }
 
+        if (updatedData.price) updatedData.price = Number(updatedData.price);
+        if (updatedData.quantity)
+          updatedData.quantity = Number(updatedData.quantity);
+
         const result = await ticketsCollection.updateOne(
-          { _id: new ObjectId(id) },
+          { _id: oid },
           { $set: updatedData }
         );
 
@@ -467,50 +577,61 @@ async function run() {
       }
     });
 
-    // ----------------------------------------------------
-    // TICKETS
-    // - POST /tickets                (vendor create)
-    // - GET  /tickets                (filters: verificationStatus, advertised)
-    // - GET  /tickets/:id
-    // - GET  /tickets/vendor/:email
-    // - PATCH /tickets/:id/approve   (admin)
-    // - PATCH /tickets/:id/reject    (admin)
-    // - PATCH /tickets/:id/advertise (toggle)
-    // - PUT  /tickets/:id            (update by vendor)
-    // - DELETE /tickets/:id
-    // - GET  /tickets/advertised?limit=N
-    // ----------------------------------------------------
-
-    // Create ticket (vendor)
-    app.post("/tickets", verifyJWT, async (req, res) => {
+    app.post("/tickets", verifyJWT, verifyVendor, async (req, res) => {
       try {
-        const ticket = req.body;
-        if (ticket.vendorEmail !== req.decoded.email) {
-          return res.status(403).send({ message: "Forbidden" });
+        const {
+          title,
+          from,
+          to,
+          transport,
+          price,
+          quantity,
+          departure,
+          image,
+          perks,
+        } = req.body;
+
+        if (
+          !title ||
+          !from ||
+          !to ||
+          !transport ||
+          !price ||
+          !quantity ||
+          !departure ||
+          !image
+        ) {
+          return res
+            .status(400)
+            .send({ message: "All required fields missing" });
         }
-        const vendor = await usersCollection.findOne({
-          email: req.decoded.email,
-        });
-        if (vendor?.isFraud) {
-          return res.status(403).send({ message: "Vendor is blocked" });
-        }
-        if (!ticket?.vendorEmail)
-          return res.status(400).send({ message: "vendorEmail required" });
-        ticket.verificationStatus = "pending";
-        ticket.advertised = false;
-        ticket.createdAt = ticket.createdAt
-          ? new Date(ticket.createdAt)
-          : new Date();
+
+        const safePerks = Array.isArray(perks) ? perks : [];
+
+        const ticket = {
+          title,
+          from,
+          to,
+          transport,
+          price: Number(price),
+          quantity: Number(quantity),
+          departure: new Date(departure),
+          image,
+          perks: safePerks,
+          vendorEmail: req.decoded.email,
+          verificationStatus: "pending",
+          advertised: false,
+          createdAt: new Date(),
+        };
 
         const result = await ticketsCollection.insertOne(ticket);
-        res.send({ success: true, insertedId: result.insertedId });
-      } catch (err) {
-        console.error("POST /tickets error:", err);
+        res.send({ success: true, ticketId: result.insertedId });
+      } catch (error) {
+        console.error("Create ticket error:", error);
         res.status(500).send({ message: "Server error" });
       }
     });
 
-    // Get tickets with optional filters
     app.get("/tickets", async (req, res) => {
       try {
         const { verificationStatus, advertised, limit, sort, vendorEmail } =
@@ -534,27 +655,6 @@ async function run() {
       }
     });
 
-    // GET advertised tickets (max limit)
-    app.get("/tickets/advertised", async (req, res) => {
-      try {
-        const limit = parseInt(req.query.limit) || 6;
-
-        const advertisedTickets = await ticketsCollection
-          .find({
-            advertised: true,
-            verificationStatus: "approved",
-            hidden: { $ne: true },
-          })
-          .limit(limit)
-          .toArray();
-
-        res.send(advertisedTickets);
-      } catch (error) {
-        res.status(400).send({ message: "Failed to fetch advertised tickets" });
-      }
-    });
-
-    // Get tickets by vendor email
     app.get("/tickets/vendor/:email", verifyJWT, async (req, res) => {
       try {
         const email = req.params.email;
@@ -576,27 +676,25 @@ async function run() {
       }
     });
 
-    // Get single ticket
-    app.get("/tickets/:id", async (req, res) => {
+    app.get("/tickets/advertised", async (req, res) => {
       try {
-        const id = req.params.id;
-        const oid = toObjectId(id);
-        if (!oid) return res.status(400).send({ message: "invalid id" });
+        const limit = parseInt(req.query.limit) || 6;
 
-        const ticket = await ticketsCollection.findOne({
-          _id: oid,
-          hidden: { $ne: true },
-        });
-        if (!ticket)
-          return res.status(404).send({ message: "Ticket not found" });
-        res.send(ticket);
-      } catch (err) {
-        console.error("GET /tickets/:id error:", err);
-        res.status(500).send({ message: "Server error" });
+        const advertisedTickets = await ticketsCollection
+          .find({
+            advertised: true,
+            verificationStatus: "approved",
+            hidden: { $ne: true },
+          })
+          .limit(limit)
+          .toArray();
+
+        res.send(advertisedTickets);
+      } catch (error) {
+        res.status(400).send({ message: "Failed to fetch advertised tickets" });
       }
     });
 
-    // Approve ticket (admin)
     app.patch(
       "/tickets/:id/approve",
       verifyJWT,
@@ -622,7 +720,6 @@ async function run() {
       }
     );
 
-    // Reject ticket (admin)
     app.patch(
       "/tickets/:id/reject",
       verifyJWT,
@@ -691,34 +788,7 @@ async function run() {
       }
     );
 
-    // Update ticket (vendor)
-    app.put("/tickets/:id", verifyJWT, async (req, res) => {
-      const id = req.params.id;
-      const update = req.body;
-      const oid = toObjectId(id);
-
-      if (!oid) {
-        return res.status(400).send({ message: "Invalid id" });
-      }
-
-      const ticket = await ticketsCollection.findOne({ _id: oid });
-
-      if (!ticket) {
-        return res.status(404).send({ message: "Ticket not found" });
-      }
-
-      // 🔐 2️⃣ IMPORTANT SECURITY CHECK (THIS IS #5)
-      if (ticket.vendorEmail !== req.decoded.email) {
-        return res.status(403).send({ message: "Forbidden" });
-      }
-
-      const result = await ticketsCollection.updateOne(
-        { _id: oid },
-        { $set: update }
-      );
-
-      res.send(result);
-    });
+ 
 
     // Delete ticket
     app.delete("/tickets/:id", verifyJWT, async (req, res) => {
@@ -742,81 +812,91 @@ async function run() {
       res.send(result);
     });
 
-    // // Get advertised tickets (homepage)
-    // app.get("/tickets/advertised", async (req, res) => {
-    //   try {
-    //     const limit = parseInt(req.query.limit) || 6;
-    //     const result = await ticketsCollection
-    //       .find({ verificationStatus: "approved", advertised: true })
-    //       .sort({ createdAt: -1 })
-    //       .limit(limit)
-    //       .toArray();
-    //     res.send(result);
-    //   } catch (err) {
-    //     console.error("GET /tickets/advertised error:", err);
-    //     res.status(500).send({ message: "Server error" });
-    //   }
-    // });
+    
+    app.get("/tickets/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const oid = toObjectId(id);
+        if (!oid) return res.status(400).send({ message: "invalid id" });
 
-    // ----------------------------------------------------
-    // BOOKINGS
-    // - POST /bookings      (create a booking, validate qty, reduce ticket quantity, status: pending)
-    // - GET  /bookings?email=... (user bookings)
-    // ----------------------------------------------------
+        const ticket = await ticketsCollection.findOne({
+          _id: oid,
+          hidden: { $ne: true },
+        });
+        if (!ticket)
+          return res.status(404).send({ message: "Ticket not found" });
+        res.send(ticket);
+      } catch (err) {
+        console.error("GET /tickets/:id error:", err);
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+
+      /* ===============================
+                  BOOKINGS
+       ================================ */
 
     app.post("/bookings", verifyJWT, async (req, res) => {
       try {
-        const booking = req.body;
+        const { ticketId, quantity, customerEmail } = req.body;
 
-        if (booking.customerEmail !== req.decoded.email) {
+        if (customerEmail !== req.decoded.email) {
           return res.status(403).send({ message: "Forbidden" });
         }
-        if (
-          !booking?.ticketId ||
-          !booking?.quantity ||
-          !booking?.customerEmail
-        ) {
+
+        if (!ticketId || !quantity || quantity <= 0) {
           return res
             .status(400)
-            .send({ message: "ticketId, quantity and customerEmail required" });
+            .send({ message: "ticketId and valid quantity required" });
         }
 
-        const ticketOid = toObjectId(booking.ticketId);
+        const ticketOid = toObjectId(ticketId);
         if (!ticketOid)
-          return res.status(400).send({ message: "invalid ticketId" });
+          return res.status(400).send({ message: "Invalid ticketId" });
 
         const ticket = await ticketsCollection.findOne({ _id: ticketOid });
         if (!ticket)
           return res.status(404).send({ message: "Ticket not found" });
 
         if (ticket.verificationStatus !== "approved") {
-          return res
-            .status(400)
-            .send({ message: "Ticket is not approved for booking" });
+          return res.status(400).send({ message: "Ticket not approved" });
         }
 
-        if (ticket.quantity < booking.quantity) {
+        const reserve = await ticketsCollection.updateOne(
+          { _id: ticketOid, quantity: { $gte: quantity } },
+          { $inc: { quantity: -quantity } }
+        );
+
+        if (!reserve.modifiedCount) {
           return res
             .status(400)
             .send({ message: "Not enough tickets available" });
         }
 
-        booking.ticketId = ticket._id;
-        booking.vendorEmail = ticket.vendorEmail;
-        booking.title = ticket.title;
-        booking.price = ticket.price;
-        booking.status = "pending";
-        booking.createdAt = new Date();
+        const newBooking = {
+          ticketId: ticket._id,
+          vendorEmail: ticket.vendorEmail,
+          customerEmail,
+          title: ticket.title,
+          price: ticket.price,
+          quantity,
+          status: "pending",
+          createdAt: new Date(),
+        };
 
-        const insert = await bookingsCollection.insertOne(booking);
-        res.send({ success: true, bookingId: insert.insertedId });
+        const result = await bookingsCollection.insertOne(newBooking);
+
+        res.send({
+          success: true,
+          bookingId: result.insertedId,
+        });
       } catch (err) {
         console.error("POST /bookings error:", err);
         res.status(500).send({ message: "Server error" });
       }
     });
 
-    // Get user bookings
     app.get("/bookings", verifyJWT, async (req, res) => {
       try {
         const email = req.query.email;
@@ -862,26 +942,32 @@ async function run() {
       }
     });
 
-    // Vendor accepts booking
     app.patch("/bookings/:id/accept", verifyJWT, async (req, res) => {
       const id = toObjectId(req.params.id);
       if (!id) return res.status(400).send({ message: "Invalid id" });
+
       const booking = await bookingsCollection.findOne({ _id: id });
       if (!booking)
         return res.status(404).send({ message: "Booking not found" });
+
       if (booking.vendorEmail !== req.decoded.email) {
         return res.status(403).send({ message: "Forbidden" });
       }
 
+      if (booking.status !== "pending") {
+        return res
+          .status(400)
+          .send({ message: "Only pending bookings can be accepted" });
+      }
+
       const result = await bookingsCollection.updateOne(
-        { _id: id, status: "pending" },
+        { _id: id },
         { $set: { status: "accepted", acceptedAt: new Date() } }
       );
 
       res.send({ success: true, modifiedCount: result.modifiedCount });
     });
 
-    // Vendor rejects booking
     app.patch("/bookings/:id/reject", verifyJWT, async (req, res) => {
       const id = toObjectId(req.params.id);
       if (!id) return res.status(400).send({ message: "Invalid id" });
@@ -889,19 +975,28 @@ async function run() {
       const booking = await bookingsCollection.findOne({ _id: id });
       if (!booking)
         return res.status(404).send({ message: "Booking not found" });
-      if (booking.vendorEmail !== req.decoded.email) {
-        return res.status(403).send({ message: "Forbidden" });
-      }
 
-      const result = await bookingsCollection.updateOne(
-        { _id: id, status: "pending" },
+      if (booking.vendorEmail !== req.decoded.email)
+        return res.status(403).send({ message: "Forbidden" });
+
+      if (booking.status !== "pending") {
+        return res
+          .status(400)
+          .send({ message: "Only pending bookings can be rejected" });
+      }
+      await ticketsCollection.updateOne(
+        { _id: booking.ticketId },
+        { $inc: { quantity: booking.quantity } }
+      );
+
+      await bookingsCollection.updateOne(
+        { _id: id },
         { $set: { status: "rejected", rejectedAt: new Date() } }
       );
 
-      res.send({ success: true, modifiedCount: result.modifiedCount });
+      res.send({ success: true });
     });
 
-    // Get booking requests for vendor
     app.get("/bookings/vendor/:email", verifyJWT, async (req, res) => {
       try {
         const vendorEmail = req.params.email;
@@ -950,29 +1045,32 @@ async function run() {
       }
     });
 
-    // ----------------------------------------------------
-    // ADMIN/stats              → users, vendors, tickets, bookings
-    // admin/revenue-overview   → revenue cards
-    // admin/revenue-chart      → charts
-    // admin/vendors/pending    → vendor approval
-    // ----------------------------------------------------
 
     /* ===============================
-       🔐 ADMIN PROFILE (FIXED)
+        ADMIN PROFILE 
     ================================ */
     app.get("/admin/profile", verifyJWT, verifyAdmin, async (req, res) => {
-      const email = req.decoded.email;
+      try {
+        const email = req.decoded.email;
 
-      const adminUser = await usersCollection.findOne({ email });
+        const adminUser = await usersCollection.findOne({ email });
 
-      res.send({
-        name: adminUser.name,
-        email: adminUser.email,
-        role: adminUser.role,
-        image: adminUser.photo,
-        phone: adminUser.phone || "",
-        joined: adminUser.createdAt,
-      });
+        if (!adminUser) {
+          return res.status(404).send({ message: "Admin not found" });
+        }
+
+        res.send({
+          name: adminUser.name,
+          email: adminUser.email,
+          role: adminUser.role,
+          photoURL: adminUser.photo || "",
+          phone: adminUser.phone || "",
+          createdAt: adminUser.createdAt || null,
+        });
+      } catch (error) {
+        console.error("Admin profile error:", error);
+        res.status(500).send({ message: "Failed to load admin profile" });
+      }
     });
 
     app.get("/admin/stats", verifyJWT, verifyAdmin, async (req, res) => {
@@ -1047,6 +1145,67 @@ async function run() {
           ticketsSold: revenueStats[0]?.ticketsSold || 0,
           ticketsAdded,
         });
+      }
+    );
+
+    /* ===============================
+             VENDOR REVENUE
+       ================================ */
+    app.get(
+      "/vendor/revenue-overview",
+      verifyJWT,
+      verifyVendor,
+      async (req, res) => {
+        try {
+          const email = req.decoded.email;
+          const tickets = await ticketsCollection
+            .find({
+              vendorEmail: email,
+              verificationStatus: "approved",
+              hidden: { $ne: true },
+            })
+            .toArray();
+
+          const ticketsAdded = tickets.length;
+
+          const payments = await paymentsCollection
+            .aggregate([
+              {
+                $lookup: {
+                  from: "tickets",
+                  localField: "ticketId",
+                  foreignField: "_id",
+                  as: "ticket",
+                },
+              },
+              { $unwind: "$ticket" },
+              {
+                $match: {
+                  "ticket.vendorEmail": email,
+                },
+              },
+            ])
+            .toArray();
+
+          const ticketsSold = payments.reduce(
+            (sum, p) => sum + (p.quantity || 0),
+            0
+          );
+
+          const totalRevenue = payments.reduce(
+            (sum, p) => sum + (p.amount || 0),
+            0
+          );
+
+          res.send({
+            totalRevenue,
+            ticketsSold,
+            ticketsAdded,
+          });
+        } catch (err) {
+          console.error("Vendor revenue error:", err);
+          res.status(500).send({ message: "Server error" });
+        }
       }
     );
 
@@ -1139,13 +1298,13 @@ async function run() {
     console.log("✅ Backend routes registered.");
   } catch (err) {
     console.error("❌ ERROR during run():", err);
-    process.exit(1);
   }
 }
 
 run().catch(console.error);
 
-// Start server
 app.listen(port, () => {
   console.log(`🔥 Server running on port ${port}`);
 });
+
+module.exports = app;
