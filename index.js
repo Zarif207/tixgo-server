@@ -1235,6 +1235,7 @@ async function run() {
       res.send(users);
     });
 
+    
     app.patch(
       "/admin/users/:id/make-admin",
       verifyJWT,
@@ -1266,6 +1267,7 @@ async function run() {
       }
     );
 
+
     app.patch(
       "/admin/users/:id/mark-fraud",
       verifyJWT,
@@ -1293,7 +1295,7 @@ async function run() {
       }
     );
 
-    // --------------------------------
+    // -------------------------------
 
     console.log("✅ Backend routes registered.");
   } catch (err) {
