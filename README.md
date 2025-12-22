@@ -1,12 +1,7 @@
 # 🎟️ TixGo – Online Ticket Booking Platform (Backend)
 
-## 📌 Project Name
-**Online Ticket Booking Platform**
 
-## 🌐 Website Name
-**TixGo**
-
-## 🔗 Live Website
+## 🌐 Live Website
 https://tixgo.netlify.app/
 
 
@@ -26,46 +21,17 @@ This repository contains the **backend API** built with **Node.js, Express, Mong
 
 ---
 
-## 🧑‍💼 User Roles & Permissions
-
-### 👤 User
-- Register/Login using Firebase Authentication
-- Browse approved tickets
-- Book tickets
-- Make secure payments via Stripe
-- View booking history
-- View payment history
-
-### 🏷️ Vendor
-- Apply for vendor account
-- Create travel tickets
-- Update tickets (if not rejected)
-- Accept or reject bookings
-- View vendor revenue overview
-- Vendor fraud protection system
-
-### 🛡️ Admin
-- Approve or reject vendor applications
-- Approve, reject, advertise tickets
-- Limit advertised tickets (max 6)
-- Manage users and roles
-- Mark vendors as fraud (auto-hide tickets)
-- View platform statistics
-- View revenue analytics & charts
-
----
-
 ## ⭐ Key Features
 
-- 🔐 Firebase Authentication with JWT verification
-- 🧾 Role-based authorization (User / Vendor / Admin)
-- 🎫 Ticket booking & inventory management
-- 💳 Secure Stripe payment integration
-- 📊 Revenue analytics for Admin & Vendor
-- 📢 Ticket advertisement system
-- 🚫 Fraud detection & vendor suspension
-- ⚡ MongoDB indexing for performance
-- 🌍 CORS-secured production-ready API
+-  Firebase Authentication with JWT verification
+-  Role-based authorization (User / Vendor / Admin)
+-  Ticket booking & inventory management
+-  Secure Stripe payment integration
+-  Revenue analytics for Vendor
+-  Ticket advertisement system
+-  Fraud detection & vendor suspension
+-  MongoDB indexing for performance
+-  CORS-secured production-ready API
 
 ---
 
