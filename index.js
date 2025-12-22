@@ -748,6 +748,7 @@ async function run() {
         res.status(400).send({ message: "Failed to fetch advertised tickets" });
       }
     });
+    
 
     app.patch(
       "/tickets/:id/approve",

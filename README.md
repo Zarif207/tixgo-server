@@ -1,7 +1,7 @@
 # 🎟️ TixGo – Online Ticket Booking Platform (Backend)
 
 
-## 🌐 Live Website
+## 🌐 Live URL
 https://tixgo.netlify.app/
 
 
