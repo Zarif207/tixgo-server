@@ -102,15 +102,15 @@ async function run() {
     // ------------------
     // DATABASE INDEXES
     // ------------------
-    await bookingsCollection.createIndex({ customerEmail: 1 });
-    await bookingsCollection.createIndex({ vendorEmail: 1 });
+    // await bookingsCollection.createIndex({ customerEmail: 1 });
+    // await bookingsCollection.createIndex({ vendorEmail: 1 });
 
-    await paymentsCollection.createIndex(
-      { transactionId: 1 },
-      { unique: true }
-    );
+    // await paymentsCollection.createIndex(
+    //   { transactionId: 1 },
+    //   { unique: true }
+    // );
 
-    await ticketsCollection.createIndex({ vendorEmail: 1 });
+    // await ticketsCollection.createIndex({ vendorEmail: 1 });
 
     /* ===============================
         Admin Middleware
@@ -234,14 +234,120 @@ async function run() {
       }
     });
 
+    // VERIFY PAYMENT
+    app.post("/payments/verify", async (req, res) => {
+      try {
+        const { sessionId } = req.body;
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        if (session.payment_status !== "paid") {
+          return res.status(400).send({ message: "Payment not completed" });
+        }
+
+        const bookingId = new ObjectId(session.metadata.bookingId);
+        const ticketId = session.metadata.ticketId;
+
+        
+        const booking = await bookingsCollection.findOne({ _id: bookingId });
+         console.log(booking)
+        if (!booking) {
+          return res.status(404).send({ message: "Booking not found" });
+        }
+
+        // prevent duplicate insert
+        const exists = await paymentsCollection.findOne({
+          transactionId: session.payment_intent,
+        });
+
+        if (exists) {
+          return res.send({ message: "Already verified" });
+        }
+
+        await paymentsCollection.insertOne({
+          bookingId,
+          ticketId,
+          customerEmail: booking.customerEmail, 
+          ticketTitle: booking.ticketTitle,
+          amount: session.amount_total / 100,
+          quantity: booking.quantity,
+          currency: session.currency,
+          transactionId: session.payment_intent,
+          paidAt: new Date(),
+        });
+
+      
+        await bookingsCollection.updateOne(
+          { _id: bookingId },
+          { $set: { paymentStatus: "paid" } }
+        );
+
+        res.send({ success: true });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Payment verification failed" });
+      }
+    });
+
+    // routes/payments.js or index.js
+
+    app.post("/payments/create-checkout-session", async (req, res) => {
+      try {
+        const { bookingId } = req.body;
+
+        const booking = await bookingsCollection.findOne({
+          _id: new ObjectId(bookingId),
+        });
+
+        if (!booking) {
+          return res.status(404).send({ message: "Booking not found" });
+        }
+
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          mode: "payment",
+
+         
+          customer_email: booking.customerEmail,
+
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                product_data: {
+                  name: booking.ticketTitle,
+                },
+                unit_amount: booking.price * 100,
+              },
+              quantity: booking.quantity,
+            },
+          ],
+
+          metadata: {
+            bookingId: booking._id.toString(),
+            ticketId: booking.ticketId,
+          },
+
+          success_url: `${process.env.SITE_DOMAIN}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.SITE_DOMAIN}/payment-cancelled`,
+        });
+
+        res.send({ url: session.url });
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ message: "Stripe session failed" });
+      }
+    });
+
     // ------------------
     // PAYMENT SUCCESS
     // ------------------
     app.get("/stripe/payment-success", async (req, res) => {
       try {
         const sessionId = req.query.session_id;
-        if (!sessionId)
+        if (!sessionId) {
           return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
+        }
 
         const session = await stripe.checkout.sessions.retrieve(sessionId);
 
@@ -250,45 +356,20 @@ async function run() {
         }
 
         const bookingId = toObjectId(session.metadata.bookingId);
-        const ticketId = toObjectId(session.metadata.ticketId);
-        const quantity = Number(session.metadata.quantity);
-
-        const booking = await bookingsCollection.findOne({ _id: bookingId });
-        if (!booking)
+        if (!bookingId) {
           return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
+        }
 
         const alreadyPaid = await paymentsCollection.findOne({
           transactionId: session.payment_intent,
         });
 
-        if (alreadyPaid) {
-          return res.redirect(`${process.env.SITE_DOMAIN}/payment-success`);
-        }
-
-        const updateBooking = await bookingsCollection.updateOne(
-          { _id: bookingId, status: "accepted" },
-          { $set: { status: "paid", paidAt: new Date() } }
+        return res.redirect(
+          `${process.env.SITE_DOMAIN}/payment-success?session_id=${sessionId}`
         );
-
-        if (!updateBooking.modifiedCount) {
-          return res.redirect(`${process.env.SITE_DOMAIN}/payment-success`);
-        }
-
-        await paymentsCollection.insertOne({
-          bookingId,
-          ticketId,
-          customerEmail: booking.customerEmail,
-          amount: session.amount_total / 100,
-          quantity,
-          currency: session.currency,
-          transactionId: session.payment_intent,
-          paidAt: new Date(),
-        });
-
-        res.redirect(`${process.env.SITE_DOMAIN}/payment-success`);
       } catch (err) {
         console.error("Payment Success Error:", err);
-        res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
+        return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
       }
     });
 
@@ -303,20 +384,22 @@ async function run() {
         }
 
         const booking = await bookingsCollection.findOne({ _id: bookingId });
-        if (!booking || booking.status !== "accepted") {
-          return res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
+
+        if (booking && booking.status === "accepted") {
+          await ticketsCollection.updateOne(
+            { _id: booking.ticketId },
+            { $inc: { quantity: booking.quantity } }
+          );
+
+          await bookingsCollection.updateOne(
+            { _id: bookingId },
+            { $set: { status: "cancelled" } }
+          );
         }
-        await ticketsCollection.updateOne(
-          { _id: booking.ticketId },
-          { $inc: { quantity: booking.quantity } }
-        );
 
-        await bookingsCollection.deleteOne({ _id: bookingId });
-
-        res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
+        return res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
       } catch (err) {
-        console.error("Payment cancel error:", err);
-        res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
+        return res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
       }
     });
 
@@ -324,42 +407,14 @@ async function run() {
     // Payment Related API
     // ------------------
     app.get("/payments", verifyJWT, async (req, res) => {
-      try {
-        const email = req.query.email;
+      const email = req.decoded.email;
 
-        if (email !== req.decoded.email) {
-          return res.status(403).send({ message: "Forbidden" });
-        }
+      const payments = await paymentsCollection
+        .find({ customerEmail: email })
+        .sort({ paidAt: -1 })
+        .toArray();
 
-        const payments = await paymentsCollection
-          .aggregate([
-            { $match: { customerEmail: email } },
-            {
-              $lookup: {
-                from: "tickets",
-                localField: "ticketId",
-                foreignField: "_id",
-                as: "ticket",
-              },
-            },
-            { $unwind: "$ticket" },
-            {
-              $project: {
-                transactionId: 1,
-                amount: 1,
-                paidAt: 1,
-                ticketTitle: "$ticket.title",
-              },
-            },
-            { $sort: { paidAt: -1 } },
-          ])
-          .toArray();
-
-        res.send(payments);
-      } catch (err) {
-        console.error("GET /payments error:", err);
-        res.status(500).send({ message: "Server error" });
-      }
+      res.send(payments);
     });
 
     /* ===============================
@@ -522,10 +577,9 @@ async function run() {
       }
     });
 
-        /* ===============================
+    /*   ===============================
                      TICKETS
-         ================================ */
-    
+         =============================== */
 
     app.patch("/tickets/:id", verifyJWT, async (req, res) => {
       try {
@@ -788,8 +842,6 @@ async function run() {
       }
     );
 
- 
-
     // Delete ticket
     app.delete("/tickets/:id", verifyJWT, async (req, res) => {
       const id = toObjectId(req.params.id);
@@ -812,7 +864,6 @@ async function run() {
       res.send(result);
     });
 
-    
     app.get("/tickets/:id", async (req, res) => {
       try {
         const id = req.params.id;
@@ -832,8 +883,7 @@ async function run() {
       }
     });
 
-
-      /* ===============================
+    /* ===============================
                   BOOKINGS
        ================================ */
 
@@ -1045,7 +1095,6 @@ async function run() {
       }
     });
 
-
     /* ===============================
         ADMIN PROFILE 
     ================================ */
@@ -1235,7 +1284,6 @@ async function run() {
       res.send(users);
     });
 
-    
     app.patch(
       "/admin/users/:id/make-admin",
       verifyJWT,
@@ -1266,7 +1314,6 @@ async function run() {
         res.send({ success: true });
       }
     );
-
 
     app.patch(
       "/admin/users/:id/mark-fraud",
