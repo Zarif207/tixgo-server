@@ -5,6 +5,7 @@ const cors = require("cors");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const admin = require("firebase-admin");
+console.log("Stripe key exists:", !!process.env.STRIPE_SECRET);
 
 let isConnected = false;
 
@@ -159,7 +160,7 @@ async function run() {
     // ------------------
     // CREATE TICKET CHECKOUT Stripe
     // ------------------
-    app.post("/create-ticket-checkout", verifyJWT, async (req, res) => {
+    app.post("/create-ticket-checkout", async (req, res) => {
       try {
         const { bookingId } = req.body;
         const bookingOid = toObjectId(bookingId);
@@ -223,9 +224,10 @@ async function run() {
             ticketId: booking.ticketId.toString(),
             quantity: quantity.toString(),
           },
-          success_url: `${process.env.BACKEND_DOMAIN}/stripe/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${process.env.BACKEND_DOMAIN}/stripe/payment-cancelled?bookingId=${booking._id}`,
+          success_url: `${process.env.SITE_DOMAIN}/stripe/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.SITE_DOMAIN}/stripe/payment-cancelled?bookingId=${booking._id}`,
         });
+        console.log("SITE_DOMAIN:", process.env.SITE_DOMAIN);
 
         res.send({ url: session.url });
       } catch (err) {
@@ -246,28 +248,25 @@ async function run() {
         }
 
         const bookingId = new ObjectId(session.metadata.bookingId);
-        const ticketId = session.metadata.ticketId;
 
-        
         const booking = await bookingsCollection.findOne({ _id: bookingId });
-         console.log(booking)
         if (!booking) {
           return res.status(404).send({ message: "Booking not found" });
         }
 
-        // prevent duplicate insert
         const exists = await paymentsCollection.findOne({
           transactionId: session.payment_intent,
         });
 
         if (exists) {
-          return res.send({ message: "Already verified" });
+          return res.send({ success: true });
         }
 
+        // INSERT PAYMENT
         await paymentsCollection.insertOne({
           bookingId,
-          ticketId,
-          customerEmail: booking.customerEmail, 
+          ticketId: booking.ticketId,
+          customerEmail: booking.customerEmail,
           ticketTitle: booking.ticketTitle,
           amount: session.amount_total / 100,
           quantity: booking.quantity,
@@ -276,10 +275,14 @@ async function run() {
           paidAt: new Date(),
         });
 
-      
+        // UPDATE BOOKING
         await bookingsCollection.updateOne(
           { _id: bookingId },
-          { $set: { paymentStatus: "paid" } }
+          {
+            $set: {
+              paymentStatus: "paid",
+            },
+          }
         );
 
         res.send({ success: true });
@@ -291,58 +294,82 @@ async function run() {
 
     // routes/payments.js or index.js
 
-    app.post("/payments/create-checkout-session", async (req, res) => {
-      try {
-        const { bookingId } = req.body;
+    app.post(
+      "/payments/create-checkout-session",
+      verifyJWT,
+      async (req, res) => {
+        try {
+          const { bookingId } = req.body;
 
-        const booking = await bookingsCollection.findOne({
-          _id: new ObjectId(bookingId),
-        });
+          const bookingOid = toObjectId(bookingId);
+          if (!bookingOid) {
+            return res.status(400).send({ message: "Invalid bookingId" });
+          }
 
-        if (!booking) {
-          return res.status(404).send({ message: "Booking not found" });
-        }
+          const booking = await bookingsCollection.findOne({ _id: bookingOid });
+          if (!booking) {
+            return res.status(404).send({ message: "Booking not found" });
+          }
 
-        const session = await stripe.checkout.sessions.create({
-          payment_method_types: ["card"],
-          mode: "payment",
+          if (booking.paymentStatus === "paid") {
+            return res.status(400).send({ message: "Already paid" });
+          }
 
-         
-          customer_email: booking.customerEmail,
+          if (booking.status !== "accepted") {
+            return res.status(400).send({ message: "Booking not accepted" });
+          }
 
-          line_items: [
-            {
-              price_data: {
-                currency: "usd",
-                product_data: {
-                  name: booking.ticketTitle,
+          const unitAmount = Math.round(Number(booking.price) * 100);
+          const quantity = Number(booking.quantity);
+
+          if (unitAmount <= 0 || quantity <= 0) {
+            return res
+              .status(400)
+              .send({ message: "Invalid price or quantity" });
+          }
+
+          if (!process.env.SITE_DOMAIN) {
+            throw new Error("SITE_DOMAIN is not defined");
+          }
+
+          const session = await stripe.checkout.sessions.create({
+            mode: "payment",
+            payment_method_types: ["card"],
+            customer_email: booking.customerEmail,
+
+            line_items: [
+              {
+                price_data: {
+                  currency: "usd",
+                  unit_amount: unitAmount,
+                  product_data: {
+                    name: booking.title, // ✅ FIXED
+                  },
                 },
-                unit_amount: booking.price * 100,
+                quantity,
               },
-              quantity: booking.quantity,
+            ],
+
+            metadata: {
+              bookingId: booking._id.toString(),
             },
-          ],
 
-          metadata: {
-            bookingId: booking._id.toString(),
-            ticketId: booking.ticketId,
-          },
+            success_url: `${process.env.SITE_DOMAIN}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.SITE_DOMAIN}/payment-cancelled`,
+          });
 
-          success_url: `${process.env.SITE_DOMAIN}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${process.env.SITE_DOMAIN}/payment-cancelled`,
-        });
-
-        res.send({ url: session.url });
-      } catch (err) {
-        console.error(err);
-        res.status(500).send({ message: "Stripe session failed" });
+          res.send({ url: session.url });
+        } catch (err) {
+          console.error("Stripe Error FULL:", err);
+          res.status(500).send({ message: err.message });
+        }
       }
-    });
+    );
 
     // ------------------
     // PAYMENT SUCCESS
     // ------------------
-    app.get("/stripe/payment-success", async (req, res) => {
+    app.post("/stripe/payment-success", async (req, res) => {
       try {
         const sessionId = req.query.session_id;
         if (!sessionId) {
@@ -350,7 +377,7 @@ async function run() {
         }
 
         const session = await stripe.checkout.sessions.retrieve(sessionId);
-
+        console.log("Stripe Session:", session);
         if (session.payment_status !== "paid") {
           return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
         }
@@ -364,12 +391,13 @@ async function run() {
           transactionId: session.payment_intent,
         });
 
-        return res.redirect(
-          `${process.env.SITE_DOMAIN}/payment-success?session_id=${sessionId}`
-        );
+        // return res.redirect(
+        //   `${process.env.SITE_DOMAIN}/payment-success?session_id=${sessionId}`
+        // );
+        res.send({ success: true, message: "Payment verified" });
       } catch (err) {
         console.error("Payment Success Error:", err);
-        return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
+        // return res.redirect(`${process.env.SITE_DOMAIN}/payment-failed`);
       }
     });
 
@@ -383,7 +411,12 @@ async function run() {
           return res.redirect(`${process.env.SITE_DOMAIN}/payment-cancelled`);
         }
 
-        const booking = await bookingsCollection.findOne({ _id: bookingId });
+        const bookingOid = toObjectId(bookingId);
+        if (!bookingOid) {
+          return res.status(400).send({ message: "Invalid bookingId" });
+        }
+
+        const booking = await bookingsCollection.findOne({ _id: bookingOid });
 
         if (booking && booking.status === "accepted") {
           await ticketsCollection.updateOne(
@@ -748,7 +781,6 @@ async function run() {
         res.status(400).send({ message: "Failed to fetch advertised tickets" });
       }
     });
-    
 
     app.patch(
       "/tickets/:id/approve",
