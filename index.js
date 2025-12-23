@@ -224,8 +224,8 @@ async function run() {
             ticketId: booking.ticketId.toString(),
             quantity: quantity.toString(),
           },
-          success_url: `${process.env.SITE_DOMAIN}/stripe/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${process.env.SITE_DOMAIN}/stripe/payment-cancelled?bookingId=${booking._id}`,
+          success_url: `${process.env.SITE_DOMAIN}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.SITE_DOMAIN}/payment-cancelled`,
         });
         console.log("SITE_DOMAIN:", process.env.SITE_DOMAIN);
 
@@ -248,12 +248,13 @@ async function run() {
         }
 
         const bookingId = new ObjectId(session.metadata.bookingId);
-
         const booking = await bookingsCollection.findOne({ _id: bookingId });
+
         if (!booking) {
           return res.status(404).send({ message: "Booking not found" });
         }
 
+        
         const exists = await paymentsCollection.findOne({
           transactionId: session.payment_intent,
         });
@@ -262,12 +263,12 @@ async function run() {
           return res.send({ success: true });
         }
 
-        // INSERT PAYMENT
+       
         await paymentsCollection.insertOne({
           bookingId,
           ticketId: booking.ticketId,
           customerEmail: booking.customerEmail,
-          ticketTitle: booking.ticketTitle,
+          ticketTitle: booking.title, 
           amount: session.amount_total / 100,
           quantity: booking.quantity,
           currency: session.currency,
@@ -275,19 +276,20 @@ async function run() {
           paidAt: new Date(),
         });
 
-        // UPDATE BOOKING
+       
         await bookingsCollection.updateOne(
           { _id: bookingId },
           {
             $set: {
-              paymentStatus: "paid",
+              status: "paid",
+              paidAt: new Date(),
             },
           }
         );
 
         res.send({ success: true });
       } catch (err) {
-        console.error(err);
+        console.error("Payment verify error:", err);
         res.status(500).send({ message: "Payment verification failed" });
       }
     });
@@ -343,7 +345,7 @@ async function run() {
                   currency: "usd",
                   unit_amount: unitAmount,
                   product_data: {
-                    name: booking.title, // ✅ FIXED
+                    name: booking.title, 
                   },
                 },
                 quantity,
